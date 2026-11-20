@@ -102,3 +102,20 @@ def test_parses_schedule(tmp_path: Path) -> None:
     write_config(tmp_path, BASE.replace('every = "hour"', 'every = "day"\nat = "05:00"'))
 
     assert load_config("demo", tmp_path).schedule.describe() == "every day at 05:00 UTC"
+
+
+def test_cache_table_is_optional_and_validated(tmp_path: Path) -> None:
+    write_config(tmp_path)
+    assert load_config("demo", tmp_path).cache_max_items is None
+
+    cached = BASE.replace("[job]", "[cache]\nmax_items = 100\n\n[job]")
+    write_config(tmp_path, cached, slug="cached")
+    assert load_config("cached", tmp_path).cache_max_items == 100
+
+    write_config(tmp_path, cached.replace("max_items = 100\n\n[job]", "max_items = 0\n\n[job]"), slug="zero")
+    with pytest.raises(ValueError, match="cache.max_items"):
+        load_config("zero", tmp_path)
+
+    write_config(tmp_path, cached.replace("max_items = 100\n\n[job]", "max_items = 5\nttl = 3\n\n[job]"), slug="extra")
+    with pytest.raises(ValueError, match=r"unknown \[cache\] setting"):
+        load_config("extra", tmp_path)

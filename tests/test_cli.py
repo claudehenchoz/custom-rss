@@ -22,6 +22,7 @@ def write_config(
     link: str = "https://example.test/feed",
     every: str = "hour",
     at: str | None = None,
+    cache: int | None = None,
 ) -> Path:
     lines = [
         f"title = {json.dumps(title)}",
@@ -36,6 +37,7 @@ def write_config(
         f"every = {json.dumps(every)}",
         *([f"at = {json.dumps(at)}"] if at else []),
         "",
+        *(["[cache]", f"max_items = {cache}", ""] if cache is not None else []),
         "[job]",
         'tier = "ultimate"',
     ]
@@ -287,3 +289,63 @@ def test_schedule_command_prints_json_and_writes_nothing(
         },
     ]
     assert sorted(tmp_path.rglob("*")) == before
+
+
+# ─── Item cache ──────────────────────────────────────────────────────────────
+
+
+def _dated(guid: str, hour: int) -> FeedItem:
+    item = make_item(f"Story {guid}", guid)
+    return FeedItem(**{**item.__dict__, "published": NOW.replace(hour=hour)})
+
+
+def _feed_guids(path: Path) -> list[str]:
+    return [element.text or "" for element in ET.parse(path).getroot().iter("guid")]
+
+
+def test_cache_keeps_items_the_source_dropped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(tmp_path, "news", cache=2)
+    batches = [(_dated("a", 1), _dated("b", 2)), (_dated("c", 3),)]
+    monkeypatch.setattr(cli, "JOBS", {"news": lambda context: batches.pop(0)})
+    directory = tmp_path / "feeds" / "news"
+
+    assert cli.main(["--root", str(tmp_path), "run", "news"]) == 0
+    assert cli.main(["--root", str(tmp_path), "run", "news"]) == 0
+
+    # "a" is the oldest and falls past the per-feed limit of 2; "b" survives its source.
+    assert _feed_guids(directory / "feed.xml") == ["c", "b"]
+    rows = [json.loads(line) for line in (directory / "cache.jsonl").read_text().splitlines()]
+    assert [row["guid"] for row in rows] == ["c", "b"]
+
+
+def test_failed_run_leaves_cache_and_feed_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(tmp_path, "news", cache=10)
+    outcomes: list[object] = [(_dated("a", 1),), RuntimeError("source down")]
+
+    def job(context: object) -> tuple[FeedItem, ...]:
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome  # type: ignore[return-value]
+
+    monkeypatch.setattr(cli, "JOBS", {"news": job})
+    directory = tmp_path / "feeds" / "news"
+    assert cli.main(["--root", str(tmp_path), "run", "news"]) == 0
+    before = {name: (directory / name).read_bytes() for name in ("feed.xml", "cache.jsonl")}
+
+    assert cli.main(["--root", str(tmp_path), "run", "news"]) == 1
+    assert {name: (directory / name).read_bytes() for name in before} == before
+
+
+def test_feeds_without_cache_table_write_no_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(tmp_path, "news")
+    monkeypatch.setattr(cli, "JOBS", {"news": lambda context: (_dated("a", 1),)})
+
+    assert cli.main(["--root", str(tmp_path), "run", "news"]) == 0
+    assert not (tmp_path / "feeds" / "news" / "cache.jsonl").exists()

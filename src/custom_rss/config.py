@@ -37,6 +37,21 @@ def _require_positive_int(raw: dict, key: str, where: Path) -> int:
     return value
 
 
+def _parse_cache(raw: Any, where: Path) -> int | None:
+    """Optional ``[cache]`` table: keep up to ``max_items`` items across runs."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where}: [cache] must be a table")
+    unknown = sorted(set(raw) - {"max_items"})
+    if unknown:
+        raise ValueError(f"{where}: unknown [cache] setting(s): {', '.join(unknown)}")
+    value = raw.get("max_items")
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{where}: setting 'cache.max_items' must be a positive integer")
+    return value
+
+
 def load_config(slug: str, root: Path) -> FeedConfig:
     """Read and validate ``root/feeds/<slug>/feed.toml``."""
 
@@ -57,6 +72,7 @@ def load_config(slug: str, root: Path) -> FeedConfig:
     if not isinstance(settings, dict):
         raise ValueError(f"{path}: a [job] table is required")
     schedule = parse_schedule(raw.get("schedule"), path)
+    cache_max_items = _parse_cache(raw.get("cache"), path)
 
     return FeedConfig(
         slug=slug,
@@ -70,4 +86,5 @@ def load_config(slug: str, root: Path) -> FeedConfig:
         directory=directory,
         settings=settings,
         schedule=schedule,
+        cache_max_items=cache_max_items,
     )

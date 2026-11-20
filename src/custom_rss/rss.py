@@ -69,6 +69,24 @@ def _source_element(item: ET.Element, source: Source) -> None:
     element.text = source.name
 
 
+def _prepare(items: Iterable[FeedItem]) -> list[tuple[datetime | None, FeedItem]]:
+    prepared = [(_validate_item(item), item) for item in items]
+    prepared.sort(
+        key=lambda entry: (
+            entry[0] is None,
+            -entry[0].timestamp() if entry[0] is not None else 0.0,
+            entry[1].title.casefold(),
+            entry[1].guid,
+        )
+    )
+    return prepared
+
+
+def sort_items(items: Iterable[FeedItem]) -> list[FeedItem]:
+    """Validate and order items exactly as the feed shows them: newest first, undated last."""
+    return [item for _, item in _prepare(items)]
+
+
 def render_feed(config: FeedConfig, items: Iterable[FeedItem]) -> bytes:
     """Render ``items`` as UTF-8 RSS 2.0 for ``config``.
 
@@ -81,18 +99,7 @@ def render_feed(config: FeedConfig, items: Iterable[FeedItem]) -> bytes:
     if not _is_http_url(config.self_url):
         raise ValueError(f"channel self URL must be an absolute HTTP(S) URL: {config.self_url!r}")
 
-    prepared: list[tuple[datetime | None, FeedItem]] = []
-    for item in items:
-        prepared.append((_validate_item(item), item))
-    prepared.sort(
-        key=lambda entry: (
-            entry[0] is None,
-            -entry[0].timestamp() if entry[0] is not None else 0.0,
-            entry[1].title.casefold(),
-            entry[1].guid,
-        )
-    )
-    prepared = prepared[: config.max_items]
+    prepared = _prepare(items)[: config.max_items]
 
     rss = ET.Element("rss", {"version": "2.0"})
     channel = ET.SubElement(rss, "channel")

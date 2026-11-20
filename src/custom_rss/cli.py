@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
+from .cache import load_cache, merge, save_cache
 from .config import load_config
 from .files import write_bytes_atomic
 from .http import USER_AGENT, HttpClient
@@ -44,6 +45,19 @@ def _write_feed(context: JobContext, items: Sequence[FeedItem]) -> None:
     log.info("Wrote %d item(s) to %s", rendered, context.config.output_path)
 
 
+def _apply_cache(context: JobContext, fresh: Sequence[FeedItem]) -> tuple[FeedItem, ...]:
+    """Merge fresh items into the feed's cache, persist it, and return what to render."""
+    config = context.config
+    cached = load_cache(config.directory)
+    merged = merge(cached, fresh, config.cache_max_items or 0)
+    fresh_guids = {item.guid for item in fresh}
+    from_cache = sum(1 for item in merged if item.guid not in fresh_guids)
+    log.info("%s cache: %d fresh, %d kept from cache, %d total (limit %d)",
+             config.slug, len(fresh_guids), from_cache, len(merged), config.cache_max_items)
+    save_cache(config.directory, merged)
+    return merged
+
+
 def run_feed(
     root: Path,
     slug: str,
@@ -59,6 +73,8 @@ def run_feed(
     except Deferred as why:
         log.info("%s deferred: %s", slug, why)
         return 0
+    if context.config.cache_max_items is not None:
+        items = _apply_cache(context, items)
     _write_feed(context, items)
     record_success(context.config.directory, context.config.schedule, context.now)
     return 0

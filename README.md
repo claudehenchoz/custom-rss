@@ -55,9 +55,11 @@ configuration or argument error.
 | `src/custom_rss/http.py` | Retrying, rate-limit-aware `HttpClient`. |
 | `src/custom_rss/sources.py` | Concurrent RSS/Atom retrieval, all-or-nothing. |
 | `src/custom_rss/rss.py` | Deterministic RSS 2.0 serialization with Atom self link and Media RSS. |
+| `src/custom_rss/cache.py` | Opt-in item cache that outlives the sources. |
 | `src/custom_rss/schedule.py` | `[schedule]` parsing and the due rule. |
 | `src/custom_rss/jobs/` | One module per feed plus the explicit `JOBS` registry. |
 | `feeds/<slug>/feed.toml` | Feed metadata, `[schedule]`, and job-specific `[job]` settings. |
+| `feeds/<slug>/cache.jsonl` | Cached items, one per line in feed order (feeds with `[cache]` only). |
 | `feeds/<slug>/last_run.json` | Start time of the last successful run (daily and weekly feeds only). |
 | `feeds/<slug>/feed.xml` | Generated output, committed by the scheduled workflow. |
 | `feeds/gamepass/state/` | Game Pass catalog diff state, run audit log, raw products. |
@@ -68,7 +70,8 @@ configuration or argument error.
 1. Add `src/custom_rss/jobs/<name>.py` exposing `build(context) -> tuple[FeedItem, ...]`
    and validate its own `[job]` settings in a `load_settings` function.
 2. Add it to `JOBS` in `src/custom_rss/jobs/__init__.py`.
-3. Add `feeds/<slug>/feed.toml` with a `[schedule]` table.
+3. Add `feeds/<slug>/feed.toml` with a `[schedule]` table, and a `[cache]` table
+   if items should outlive their sources.
 4. Add focused job tests; no workflow, shared runner, or renderer edit is needed
    unless the feed requires a new RSS field.
 
@@ -105,6 +108,25 @@ fetch gate is in `cooldown` after a failure.
 
 Manual runs: dispatch the **Feeds** workflow with `feed` set to run one feed now,
 and `force` to also bypass that feed's own rate limit.
+
+## Caching
+
+A feed rebuilt from publisher RSS loses an article as soon as the publisher's
+feed drops it. An optional `[cache]` table keeps items across runs:
+
+```toml
+[cache]
+max_items = 100           # per feed; zurich-finance uses 100
+```
+
+After each successful run, the fresh items are merged with
+`feeds/<slug>/cache.jsonl` by guid (a fresh copy replaces the cached one, so
+edited titles are picked up). The result is ordered like the feed (newest first,
+undated last) and trimmed to `max_items`, and that is what the feed renders. The
+feed shows at most the smaller of the top-level `max_items` and `cache.max_items`.
+A failed or deferred run leaves the cache untouched. The file has no wall-clock
+values, so an unchanged run creates no commit. Game Pass has no `[cache]`: its
+own state already keeps every announced game.
 
 ## State machines
 
@@ -152,6 +174,7 @@ files whose content changed, or `rollback()` reloads from disk.
   values are emitted, so unchanged feeds produce no content-free commits.
 - GUIDs are stable and never derived from this repository's URL.
 - Feed writes and state writes are atomic (sibling `.tmp` then `os.replace`).
+- Cached items survive their removal from the source, up to `cache.max_items`.
 - A failed fetch leaves the last-good feed and state untouched. Game Pass records
   one `failed` audit row so the failure is visible in history.
 - Each tick makes at most one commit, containing every changed `feeds/<slug>/`;

@@ -53,6 +53,7 @@ class FeedConfig:
     directory: Path
     settings: Mapping[str, Any]
     schedule: Schedule
+    cache_max_items: int | None = None    # [cache] max_items; None = no cache
 
     @property
     def output_path(self) -> Path:
