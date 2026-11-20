@@ -1,0 +1,23 @@
+name: Zurich finance feed
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Fetch even if the job's own rate limit says otherwise"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "17 * * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    uses: ./.github/workflows/run-feed.yml
+    with:
+      feed: zurich-finance
+      force: ${{ inputs.force || false }}
+    permissions:
+      contents: write

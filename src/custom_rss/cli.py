@@ -1,0 +1,155 @@
+"""One CLI for listing, running, rendering and inspecting registered feed jobs."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Sequence
+
+from .config import load_config
+from .files import write_bytes_atomic
+from .http import USER_AGENT, HttpClient
+from .jobs import JOBS, gamepass
+from .models import FeedItem, JobContext
+from .rss import render_feed
+
+log = logging.getLogger("custom_rss")
+
+
+def _context(
+    root: Path,
+    slug: str,
+    *,
+    force: bool = False,
+    client: HttpClient | None = None,
+    now: datetime | None = None,
+) -> JobContext:
+    config = load_config(slug, root)
+    return JobContext(
+        config=config,
+        http=client if client is not None else HttpClient(USER_AGENT),
+        now=now if now is not None else datetime.now(timezone.utc),
+        force=force,
+    )
+
+
+def _write_feed(context: JobContext, items: Sequence[FeedItem]) -> None:
+    payload = render_feed(context.config, items)
+    write_bytes_atomic(context.config.output_path, payload)
+    rendered = min(len(items), context.config.max_items)
+    log.info("Wrote %d item(s) to %s", rendered, context.config.output_path)
+
+
+def run_feed(
+    root: Path,
+    slug: str,
+    *,
+    force: bool = False,
+    client: HttpClient | None = None,
+    now: datetime | None = None,
+) -> int:
+    context = _context(root, slug, force=force, client=client, now=now)
+    items = JOBS[slug](context)
+    _write_feed(context, items)
+    return 0
+
+
+def render_gamepass(
+    root: Path, *, client: HttpClient | None = None, now: datetime | None = None
+) -> int:
+    context = _context(root, "gamepass", client=client, now=now)
+    _write_feed(context, gamepass.render_offline(context))
+    return 0
+
+
+def backfill_gamepass(
+    root: Path,
+    count: int | None,
+    *,
+    client: HttpClient | None = None,
+    now: datetime | None = None,
+) -> int:
+    context = _context(root, "gamepass", client=client, now=now)
+    if count is None:
+        count = gamepass.load_settings(context.config).bootstrap_announce
+    if count < 0:
+        raise ValueError("backfill count must be >= 0")
+    _write_feed(context, gamepass.backfill(context, count))
+    return 0
+
+
+def dump_gamepass(
+    root: Path,
+    product_id: str,
+    *,
+    client: HttpClient | None = None,
+    now: datetime | None = None,
+) -> int:
+    context = _context(root, "gamepass", client=client, now=now)
+    product = gamepass.dump(context, product_id)
+    if product is None:
+        log.error("No stored product %s", product_id)
+        return 1
+    print(json.dumps(product, indent=2, ensure_ascii=False))
+    return 0
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="custom-rss", description=__doc__)
+    parser.add_argument("--root", type=Path, default=Path("."), help="repository root (default: .)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser("list", help="list registered feed slugs")
+
+    run = subparsers.add_parser("run", help="run one feed job and write its feed")
+    run.add_argument("feed", choices=sorted(JOBS))
+    run.add_argument("--force", action="store_true", help="bypass the feed's own rate limit")
+
+    render = subparsers.add_parser("render", help="rewrite a feed from stored state; no network")
+    render.add_argument("feed", choices=["gamepass"])
+
+    backfill = subparsers.add_parser("backfill", help="re-announce bootstrap-seeded Game Pass games")
+    backfill.add_argument("feed", choices=["gamepass"])
+    backfill.add_argument("count", nargs="?", type=int, default=None, metavar="N")
+
+    dump = subparsers.add_parser("dump", help="print stored raw store JSON for one product")
+    dump.add_argument("feed", choices=["gamepass"])
+    dump.add_argument("product_id", metavar="PRODUCT_ID")
+
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)-7s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    root = Path(args.root)
+
+    try:
+        if args.command == "list":
+            for slug in JOBS:
+                print(slug)
+            return 0
+        if args.command == "run":
+            return run_feed(root, args.feed, force=args.force)
+        if args.command == "render":
+            return render_gamepass(root)
+        if args.command == "backfill":
+            return backfill_gamepass(root, args.count)
+        if args.command == "dump":
+            return dump_gamepass(root, args.product_id)
+    except (ValueError, FileNotFoundError) as error:
+        log.error("%s", error)
+        return 2
+    except Exception as error:  # noqa: BLE001 - CLI boundary: report and exit non-zero
+        log.error("%s", error)
+        return 1
+    return 2

@@ -1,0 +1,49 @@
+title = "Zurich Financial Services News"
+description = "Zurich-focused banks, insurers and financial infrastructure, filtered from Swiss newspaper RSS feeds."
+link = "https://github.com/claudehenchoz/custom-rss"
+self_url = "https://claudehenchoz.github.io/custom-rss/feeds/zurich-finance/feed.xml"
+language = "de-ch"
+ttl = 60
+max_items = 100
+
+[job]
+max_workers = 5
+patterns = [
+  '\bUBS\b',
+  '\bCredit[ -]Suisse\b',
+  '\bJulius[ -]B(?:ä|ae)r\b',
+  '\bZ(?:ür|uer)cher[ -]Kantonalbank\b|\bZKB\b',
+  '\bVontobel\b',
+  '\bZurich[ -](?:Insurance|Versicherung)(?:[ -]Group)?\b',
+  '\bSwiss[ -]Re\b',
+  '\bSwiss[ -]Life\b',
+  '\bSIX[ -](?:Group|Swiss[ -]Exchange)\b|\bSchweizer[ -]Börse\b',
+  '\bEFG[ -]International\b',
+  '\bLeonteq\b',
+  '\bAvaloq\b',
+  '\bMigros[ -]Bank\b',
+  '\bBellevue[ -]Group\b|\bBank[ -]am[ -]Bellevue\b',
+  '\bAXA[ -](?:Winterthur|Schweiz)\b',
+  '\bSchweizerische[ -]Nationalbank\b|\bSwiss[ -]National[ -]Bank\b|\bSNB\b',
+  '\bFinanzplatz[ -]Z(?:ür|uer)ich\b|\bParadeplatz\b',
+]
+
+[[job.sources]]
+name = "NZZ Wirtschaft"
+url = "https://www.nzz.ch/wirtschaft.rss"
+
+[[job.sources]]
+name = "NZZ Finanzen"
+url = "https://www.nzz.ch/finanzen.rss"
+
+[[job.sources]]
+name = "NZZ Zürich"
+url = "https://www.nzz.ch/zuerich.rss"
+
+[[job.sources]]
+name = "Tages-Anzeiger Wirtschaft"
+url = "https://www.tagesanzeiger.ch/wirtschaft/rss.html"
+
+[[job.sources]]
+name = "20 Minuten Wirtschaft"
+url = "https://partner-feeds.20min.ch/rss/20minuten/wirtschaft"

@@ -1,0 +1,17 @@
+title = "New on Game Pass Ultimate (PC, CH)"
+description = "Games newly added to the Xbox Game Pass catalog."
+link = "https://www.xbox.com/en-us/xbox-game-pass"
+self_url = "https://claudehenchoz.github.io/custom-rss/feeds/gamepass/feed.xml"
+language = "en-us"
+ttl = 1440
+max_items = 100
+
+[job]
+tier = "ultimate"
+platform = "pc"
+market = "CH"
+bootstrap_announce = 100
+max_fetches_per_day = 1
+failed_retry_cooldown_hours = 6
+max_shrink_ratio = 0.10
+relisting_window_days = 30
