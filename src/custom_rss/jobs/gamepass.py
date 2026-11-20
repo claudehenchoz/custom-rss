@@ -8,7 +8,7 @@ Once per UTC day (or when forced), this job:
   4. Lets the shared renderer publish one item per announced addition.
 
 Design rules preserved from the original single-file generator:
-  * At most one successful catalog fetch per calendar day; --force bypasses.
+  * At most one successful catalog fetch per UTC day; --force bypasses.
   * A failed fetch never touches the feed. Last-good state is kept.
   * The first ever run seeds the state silently; bootstrap can be replayed.
   * A product ID that merely replaces a recent listing of the same game
@@ -21,8 +21,10 @@ import json
 import logging
 import re
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from enum import Enum, StrEnum
 from html import escape as html_escape
 from pathlib import Path
 from typing import Any, Iterable
@@ -455,40 +457,128 @@ def family_key(title: str) -> str:
 #
 # products.jsonl fields: product_id, title, family_key, first_seen (ISO UTC),
 # removed_at (ISO UTC or null; cleared if it returns), announced (bool),
-# suppressed_reason ('bootstrap' | 'relisting' | null), info (GameInfo).
+# suppressed_reason (see Admission), info (GameInfo).
 #
 # There is deliberately no per-product "last_seen": updating it would rewrite
 # every line every day. Presence is "removed_at is null"; see family_last_seen.
+#
+# Every state machine below is spelled out in README.md ("State machines") and
+# printed live by `custom-rss status gamepass`.
+
+
+class RunStatus(StrEnum):
+    """``runs.jsonl`` status. A run the fetch gate skips records nothing."""
+
+    OK = "ok"
+    FAILED = "failed"
+
+
+class Admission(Enum):
+    """How a product ID entered the store, persisted as ``suppressed_reason``.
+
+    Decided once, when the ID is first seen, and never changed. It fixes which
+    values ``announced`` may hold:
+
+      FRESH      null          announced is always true
+      RELISTING  "relisting"   announced is always false (a product of the same
+                               title family was listed within relisting_window_days)
+      BOOTSTRAP  "bootstrap"   seeded silently on the first run; ``backfill``
+                               sets announced for the newest N by added date
+
+    ``announced=true`` with ``"bootstrap"`` is therefore valid: a seeded game
+    that backfill chose to publish. Rows are validated against this on load.
+    """
+
+    FRESH = None
+    RELISTING = "relisting"
+    BOOTSTRAP = "bootstrap"
+
+
+_ALLOWED_ANNOUNCED: dict[Admission, frozenset[bool]] = {
+    Admission.FRESH: frozenset({True}),
+    Admission.RELISTING: frozenset({False}),
+    Admission.BOOTSTRAP: frozenset({True, False}),
+}
+
+
+def _validate_product(record: Any, where: str) -> None:
+    if not isinstance(record, dict) or not isinstance(record.get("product_id"), str):
+        raise ValueError(f"{where}: product row must be a JSON object with a string product_id")
+    product_id = record["product_id"]
+    reason = record.get("suppressed_reason")
+    try:
+        admission = Admission(reason)
+    except ValueError:
+        raise ValueError(
+            f"{where}: product {product_id}: suppressed_reason {reason!r} must be null, "
+            f"'relisting' or 'bootstrap'"
+        ) from None
+    announced = record.get("announced")
+    if not isinstance(announced, bool) or announced not in _ALLOWED_ANNOUNCED[admission]:
+        allowed = " or ".join(str(value).lower() for value in sorted(_ALLOWED_ANNOUNCED[admission]))
+        raise ValueError(
+            f"{where}: product {product_id}: announced must be {allowed} when "
+            f"suppressed_reason is {reason!r}, got {announced!r}"
+        )
+    for key in ("first_seen", "removed_at"):
+        value = record.get(key)
+        if value is None and key == "removed_at":
+            continue
+        try:
+            datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{where}: product {product_id}: {key} must be an ISO datetime, got {value!r}") from None
+
+
+def _validate_run(run: Any, where: str) -> None:
+    if not isinstance(run, dict):
+        raise ValueError(f"{where}: run row must be a JSON object")
+    if run.get("status") not in tuple(RunStatus):
+        raise ValueError(f"{where}: run status {run.get('status')!r} must be one of {[s.value for s in RunStatus]}")
+    try:
+        datetime.fromisoformat(run.get("started_at"))
+    except (TypeError, ValueError):
+        raise ValueError(f"{where}: run started_at must be an ISO datetime, got {run.get('started_at')!r}") from None
 
 
 class Store:
-    """In-memory state loaded from the state directory; nothing touches disk until commit()."""
+    """In-memory state loaded from the state directory; nothing touches disk until commit().
+
+    Transaction states: LOADED (matches disk) -> DIRTY (after any mutation) ->
+    commit() writes only the files whose content changed, or rollback() reloads.
+    """
 
     def __init__(self, data_dir: Path):
         self.data_dir = data_dir
         self._load()
 
     def _load(self) -> None:
-        self.products: dict[str, dict] = {
-            record["product_id"]: record for record in _read_jsonl(self.data_dir / PRODUCTS_FILE)
-        }
-        self.runs: list[dict] = _read_jsonl(self.data_dir / RUNS_FILE)
+        self.products: dict[str, dict] = {}
+        for where, record in _read_jsonl(self.data_dir / PRODUCTS_FILE):
+            _validate_product(record, where)
+            self.products[record["product_id"]] = record
+        self.runs: list[dict] = []
+        for where, run in _read_jsonl(self.data_dir / RUNS_FILE):
+            _validate_run(run, where)
+            self.runs.append(run)
         self._pending_raw: dict[str, dict] = {}
         self._pending_listing: bytes | None = None
+        self._committed_products = _render_products(self.products)
+        self._committed_runs = _render_runs(self.runs)
 
     # ── runs ──────────────────────────────────────────────────────────────────
 
-    def last_run(self, status: str) -> dict | None:
-        matching = [run for run in self.runs if run["status"] == status]
-        return max(matching, key=lambda run: run["started_at"]) if matching else None
+    def last_run(self, status: RunStatus | None = None) -> dict | None:
+        """Most recent run, optionally only of one status."""
+        matching = [run for run in self.runs if status is None or run["status"] == status]
+        return max(matching, key=lambda run: datetime.fromisoformat(run["started_at"])) if matching else None
 
-    def successful_runs_on(self, local_date: str) -> int:
-        # started_at is UTC; "per day" is evaluated in the local timezone.
-        return sum(1 for run in self.runs if run["status"] == "ok" and _to_local_date(run["started_at"]) == local_date)
+    def successful_runs_on(self, utc_date: str) -> int:
+        return sum(1 for run in self.runs if run["status"] == RunStatus.OK and _utc_date(run["started_at"]) == utc_date)
 
-    def record_run(self, started_at: datetime, status: str, raw_listing: bytes | None = None,
+    def record_run(self, started_at: datetime, status: RunStatus, raw_listing: bytes | None = None,
                    **fields: Any) -> None:
-        run = {"started_at": started_at.isoformat(), "status": status, "product_count": None, "added": None,
+        run = {"started_at": started_at.isoformat(), "status": status.value, "product_count": None, "added": None,
                "announced": None, "removed": None, "error": None}
         run.update(fields)
         self.runs.append(run)
@@ -496,6 +586,11 @@ class Store:
             self._pending_listing = raw_listing
 
     # ── products ──────────────────────────────────────────────────────────────
+    #
+    # Per product, two independent axes:
+    #   presence:      (new) --admit--> LISTED <--mark_removed / mark_present--> DELISTED
+    #   announcement:  fixed by Admission at admit(); only BOOTSTRAP rows may
+    #                  change it later, via set_bootstrap_announced (backfill).
 
     def known_product_ids(self) -> set[str]:
         return set(self.products)
@@ -518,8 +613,9 @@ class Store:
             return now
         return max(datetime.fromisoformat(record["removed_at"]) for record in members)
 
-    def insert_product(self, info: GameInfo, raw_product: dict | None, seen_at: datetime,
-                       announced: bool, suppressed_reason: str | None) -> None:
+    def admit(self, info: GameInfo, raw_product: dict | None, seen_at: datetime, admission: Admission) -> bool:
+        """new -> LISTED. Returns whether the product is announced."""
+        announced = admission is Admission.FRESH
         self.products[info.product_id] = {
             "product_id": info.product_id,
             "title": info.title,
@@ -527,17 +623,29 @@ class Store:
             "first_seen": seen_at.isoformat(),
             "removed_at": None,
             "announced": announced,
-            "suppressed_reason": suppressed_reason,
+            "suppressed_reason": admission.value,
             "info": info.__dict__.copy(),
         }
         if raw_product:
             self._pending_raw[info.product_id] = raw_product
+        return announced
 
-    def mark_present(self, product_ids: Iterable[str], seen_at: datetime) -> None:
+    def mark_present(self, product_ids: Iterable[str]) -> int:
+        """DELISTED -> LISTED for IDs that are back. Returns how many came back.
+
+        A returning ID keeps its admission and announcement: it is never
+        re-announced, and its GUID was already delivered to readers.
+        """
+        count = 0
         for product_id in product_ids:
-            self.products[product_id]["removed_at"] = None
+            record = self.products[product_id]
+            if record["removed_at"] is not None:
+                record["removed_at"] = None
+                count += 1
+        return count
 
     def mark_removed(self, product_ids: Iterable[str], seen_at: datetime) -> int:
+        """LISTED -> DELISTED. Returns how many were listed before."""
         count = 0
         for product_id in product_ids:
             record = self.products[product_id]
@@ -555,7 +663,7 @@ class Store:
         """(product_id, title, raw product or None) for every row seeded at bootstrap."""
         return [
             (record["product_id"], record["title"], self.raw_product(record["product_id"]))
-            for record in self.products.values() if record["suppressed_reason"] == "bootstrap"
+            for record in self.products.values() if record["suppressed_reason"] == Admission.BOOTSTRAP.value
         ]
 
     def raw_product(self, product_id: str) -> dict | None:
@@ -565,22 +673,30 @@ class Store:
         path = self.data_dir / RAW_DIR / f"{product_id}.json"
         return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
 
-    def set_first_seen(self, product_id: str, first_seen: datetime) -> None:
-        self.products[product_id]["first_seen"] = first_seen.isoformat()
+    def _bootstrap_record(self, product_id: str) -> dict:
+        record = self.products[product_id]
+        if record["suppressed_reason"] != Admission.BOOTSTRAP.value:
+            raise ValueError(f"product {product_id} was not seeded at bootstrap; backfill may not change it")
+        return record
 
-    def set_announced(self, product_ids: Iterable[str], announced: bool) -> None:
+    def set_first_seen(self, product_id: str, first_seen: datetime) -> None:
+        self._bootstrap_record(product_id)["first_seen"] = first_seen.isoformat()
+
+    def set_bootstrap_announced(self, product_ids: Iterable[str], announced: bool) -> None:
         for product_id in product_ids:
-            self.products[product_id]["announced"] = announced
+            self._bootstrap_record(product_id)["announced"] = announced
 
     # ── persistence ───────────────────────────────────────────────────────────
 
     def commit(self) -> None:
+        """Write only what changed, so a failed run touches runs.jsonl alone."""
         # Raw files first: products.jsonl must never reference a product whose
         # raw file failed to write.
-        raw_dir = self.data_dir / RAW_DIR
-        raw_dir.mkdir(parents=True, exist_ok=True)
-        for product_id, raw in self._pending_raw.items():
-            write_text_atomic(raw_dir / f"{product_id}.json", _dumps(raw) + "\n")
+        if self._pending_raw:
+            raw_dir = self.data_dir / RAW_DIR
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            for product_id, raw in self._pending_raw.items():
+                write_text_atomic(raw_dir / f"{product_id}.json", _dumps(raw) + "\n")
         if self._pending_listing is not None:
             # Indented so each product ID sits on its own line: the git diff of
             # this file is then exactly the day's additions and removals.
@@ -589,14 +705,14 @@ class Store:
                 self.data_dir / CATALOG_FILE,
                 json.dumps(listing, ensure_ascii=False, indent=1) + "\n",
             )
-        write_text_atomic(
-            self.data_dir / PRODUCTS_FILE,
-            "".join(_dumps(self.products[pid]) + "\n" for pid in sorted(self.products)),
-        )
-        write_text_atomic(
-            self.data_dir / RUNS_FILE,
-            "".join(_dumps(run) + "\n" for run in self.runs),
-        )
+        products = _render_products(self.products)
+        if products != self._committed_products:
+            write_text_atomic(self.data_dir / PRODUCTS_FILE, products)
+            self._committed_products = products
+        runs = _render_runs(self.runs)
+        if runs != self._committed_runs:
+            write_text_atomic(self.data_dir / RUNS_FILE, runs)
+            self._committed_runs = runs
         self._pending_raw.clear()
         self._pending_listing = None
 
@@ -609,15 +725,32 @@ def _dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
-def _read_jsonl(path: Path) -> list[dict]:
+def _render_products(products: dict[str, dict]) -> str:
+    return "".join(_dumps(products[pid]) + "\n" for pid in sorted(products))
+
+
+def _render_runs(runs: list[dict]) -> str:
+    return "".join(_dumps(run) + "\n" for run in runs)
+
+
+def _read_jsonl(path: Path) -> list[tuple[str, Any]]:
+    """(``path:line`` for error messages, parsed row) for every non-blank line."""
     if not path.exists():
         return []
+    rows: list[tuple[str, Any]] = []
     with path.open(encoding="utf-8") as handle:
-        return [json.loads(line) for line in handle if line.strip()]
+        for number, line in enumerate(handle, start=1):
+            if line.strip():
+                where = f"{path}:{number}"
+                try:
+                    rows.append((where, json.loads(line)))
+                except json.JSONDecodeError as error:
+                    raise ValueError(f"{where}: invalid JSON: {error}") from None
+    return rows
 
 
-def _to_local_date(iso_utc: str) -> str:
-    return datetime.fromisoformat(iso_utc).astimezone().date().isoformat()
+def _utc_date(iso: str) -> str:
+    return datetime.fromisoformat(iso).astimezone(timezone.utc).date().isoformat()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -625,32 +758,51 @@ def _to_local_date(iso_utc: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-class SkipFetch(Exception):
-    """Not an error: we chose not to hit Microsoft this run."""
+class Gate(StrEnum):
+    """Whether this run may hit Microsoft, derived from runs.jsonl history."""
+
+    OPEN = "open"                # Fetch.
+    FORCED = "forced"            # --force: fetch regardless of history.
+    DAILY_LIMIT = "daily-limit"  # max_fetches_per_day successful runs already this UTC day.
+    COOLDOWN = "cooldown"        # Latest run failed less than failed_retry_cooldown_hours ago.
 
 
-def check_fetch_allowed(store: Store, now: datetime, force: bool, settings: GamePassSettings) -> None:
-    """Enforce the once-per-day rule and the post-failure cooldown."""
+@dataclass(frozen=True)
+class FetchGate:
+    state: Gate
+    reason: str
+
+    @property
+    def allows_fetch(self) -> bool:
+        return self.state in (Gate.OPEN, Gate.FORCED)
+
+
+def fetch_gate(store: Store, now: datetime, force: bool, settings: GamePassSettings) -> FetchGate:
+    """The single decision point for the once-per-day rule and the post-failure cooldown."""
     if force:
-        return
-    today = now.astimezone().date().isoformat()
-    if store.successful_runs_on(today) >= settings.max_fetches_per_day:
-        raise SkipFetch(f"already fetched successfully today ({today})")
-    last_failed = store.last_run("failed")
-    if last_failed:
-        failed_at = datetime.fromisoformat(last_failed["started_at"])
-        cooldown = timedelta(hours=settings.failed_retry_cooldown_hours)
-        last_ok = store.last_run("ok")
-        ok_after_failure = last_ok and datetime.fromisoformat(last_ok["started_at"]) > failed_at
-        if not ok_after_failure and now - failed_at < cooldown:
-            raise SkipFetch(f"last fetch failed at {failed_at:%Y-%m-%d %H:%M} UTC; cooling down for {cooldown}")
+        return FetchGate(Gate.FORCED, "--force bypasses the daily limit and failure cooldown")
+    today = _utc_date(now.isoformat())
+    done = store.successful_runs_on(today)
+    limit = settings.max_fetches_per_day
+    if done >= limit:
+        return FetchGate(Gate.DAILY_LIMIT, f"{done} of {limit} successful fetch(es) already used on {today} UTC")
+    latest = store.last_run()
+    if latest and latest["status"] == RunStatus.FAILED:
+        failed_at = datetime.fromisoformat(latest["started_at"]).astimezone(timezone.utc)
+        retry_at = failed_at + timedelta(hours=settings.failed_retry_cooldown_hours)
+        if now < retry_at:
+            return FetchGate(
+                Gate.COOLDOWN,
+                f"last fetch failed at {failed_at:%Y-%m-%d %H:%M} UTC; next attempt after {retry_at:%Y-%m-%d %H:%M} UTC",
+            )
+    return FetchGate(Gate.OPEN, f"{done} of {limit} successful fetch(es) used on {today} UTC")
 
 
 def validate_listing(listing: CatalogListing, store: Store, settings: GamePassSettings) -> None:
     """Refuse to believe an implausible response. Raises FetchError."""
     if not listing.product_ids:
         raise FetchError("catalog list came back empty")
-    last_ok = store.last_run("ok")
+    last_ok = store.last_run(RunStatus.OK)
     if last_ok and last_ok["product_count"]:
         floor = int(last_ok["product_count"] * (1 - settings.max_shrink_ratio))
         if len(listing.product_ids) < floor:
@@ -675,7 +827,7 @@ def sync_catalog(
     listing = fetch_catalog_listing(settings, http)
     validate_listing(listing, store, settings)
 
-    is_bootstrap = store.is_empty()
+    is_bootstrap = store.is_empty()     # Catalog phase: BOOTSTRAP (no rows yet) or STEADY.
     current = set(listing.product_ids)
     known = store.known_product_ids()
     new_ids = sorted(current - known)
@@ -686,8 +838,10 @@ def sync_catalog(
 
     # Update presence first, so relisting detection below sees accurate presence
     # for everything *except* the newcomers we're about to insert.
-    store.mark_present(current & known, now)
+    returned = store.mark_present(current & known)
     removed = store.mark_removed(gone_ids, now)
+    if returned:
+        log.info("%d product(s) back under a known ID; not re-announced", returned)
 
     announced_count = 0
     for product_id in new_ids:
@@ -704,12 +858,13 @@ def sync_catalog(
         else:
             info = extract_game_info(settings, product_id, raw)
 
-        announced, reason = decide_announcement(store, info, now, is_bootstrap, settings)
+        admission = decide_admission(store, info, now, is_bootstrap, settings)
+        announced = store.admit(info, raw, now, admission)
         announced_count += int(announced)
-        store.insert_product(info, raw, now, announced, reason)
-        log.info("%-12s %s%s", "NEW" if announced else "SUPPRESSED", info.title, f"  [{reason}]" if reason else "")
+        log.info("%-12s %s%s", "NEW" if announced else "SUPPRESSED", info.title,
+                 f"  [{admission.value}]" if admission.value else "")
 
-    store.record_run(now, "ok", product_count=len(current), added=len(new_ids), announced=announced_count,
+    store.record_run(now, RunStatus.OK, product_count=len(current), added=len(new_ids), announced=announced_count,
                      removed=removed, raw_listing=listing.raw_json)
     if is_bootstrap and settings.bootstrap_announce > 0:
         announced_count = backfill_bootstrap(store, settings, settings.bootstrap_announce)
@@ -720,8 +875,8 @@ def sync_catalog(
 def backfill_bootstrap(store: Store, settings: GamePassSettings, announce_newest: int) -> int:
     """Give bootstrap-seeded products a real 'added' date and announce the newest N.
 
-    Idempotent: only touches rows whose suppressed_reason is 'bootstrap'. Rows
-    whose date can't be inferred keep their original first_seen and stay silent.
+    Idempotent: only touches rows admitted as BOOTSTRAP. Rows whose date can't
+    be inferred keep their original first_seen and stay silent.
     """
     dated: list[tuple[datetime, str, str]] = []       # (added, product_id, title)
     sources: dict[str, int] = {}
@@ -739,8 +894,8 @@ def backfill_bootstrap(store: Store, settings: GamePassSettings, announce_newest
 
     dated.sort(reverse=True)
     chosen = dated[:announce_newest]
-    store.set_announced([pid for _, pid, _ in dated], False)      # Reset, so re-running with a smaller N works
-    store.set_announced([pid for _, pid, _ in chosen], True)
+    store.set_bootstrap_announced([pid for _, pid, _ in dated], False)      # Reset, so re-running with a smaller N works
+    store.set_bootstrap_announced([pid for _, pid, _ in chosen], True)
 
     log.info("Backfill: dated %d bootstrap products (sources: %s); announcing newest %d",
              len(dated), ", ".join(f"{k}={v}" for k, v in sorted(sources.items())), len(chosen))
@@ -751,21 +906,21 @@ def backfill_bootstrap(store: Store, settings: GamePassSettings, announce_newest
     return len(chosen)
 
 
-def decide_announcement(
+def decide_admission(
     store: Store, info: GameInfo, now: datetime, is_bootstrap: bool, settings: GamePassSettings
-) -> tuple[bool, str | None]:
-    """Should this newly seen product ID appear in the feed?
+) -> Admission:
+    """How does this newly seen product ID enter the store?
 
-    * First run ever: no — we're just learning what's already there.
-    * Same title seen recently under another product ID: no — it's a relisting.
-    * Otherwise: yes.
+    * First run ever: BOOTSTRAP — we're just learning what's already there.
+    * Same title family listed recently under another ID: RELISTING.
+    * Otherwise: FRESH, which is announced.
     """
     if is_bootstrap:
-        return False, "bootstrap"
+        return Admission.BOOTSTRAP
     seen = store.family_last_seen(family_key(info.title), now)
     if seen and now - seen < timedelta(days=settings.relisting_window_days):
-        return False, "relisting"
-    return True, None
+        return Admission.RELISTING
+    return Admission.FRESH
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -832,18 +987,19 @@ def announced_items(store: Store) -> tuple[FeedItem, ...]:
 def build(context: JobContext) -> tuple[FeedItem, ...]:
     settings = load_settings(context.config)
     store = Store(context.config.state_dir)
-    try:
-        check_fetch_allowed(store, context.now, context.force, settings)
-    except SkipFetch as why:
-        log.info("Not fetching: %s", why)
+    gate = fetch_gate(store, context.now, context.force, settings)
+    if not gate.allows_fetch:
+        log.info("Not fetching (%s): %s", gate.state, gate.reason)
         return announced_items(store)
+    log.info("Fetching (%s): %s", gate.state, gate.reason)
 
     try:
         result = sync_catalog(store, context.now, settings, context.http)
     except FetchError as error:
-        # Nothing has been committed; last-good state is intact.
+        # Nothing has been committed; last-good state is intact. Only the
+        # failed audit row is written (commit() skips unchanged files).
         store.rollback()
-        store.record_run(context.now, "failed", error=str(error))
+        store.record_run(context.now, RunStatus.FAILED, error=str(error))
         store.commit()
         log.error("Fetch failed, feed left unchanged: %s", error)
         raise
@@ -855,6 +1011,29 @@ def build(context: JobContext) -> tuple[FeedItem, ...]:
         result.removed,
     )
     return announced_items(store)
+
+
+def status(context: JobContext) -> dict[str, Any]:
+    """Read-only snapshot of every state machine; no network, no writes.
+
+    ``products`` counts rows by ``presence/admission/announcement``, e.g.
+    ``listed/fresh/announced`` or ``delisted/bootstrap/silent``.
+    """
+    settings = load_settings(context.config)
+    store = Store(context.config.state_dir)
+    gate = fetch_gate(store, context.now, context.force, settings)
+    counts: Counter[str] = Counter()
+    for record in store.products.values():
+        presence = "listed" if record["removed_at"] is None else "delisted"
+        admission = Admission(record["suppressed_reason"]).name.lower()
+        announcement = "announced" if record["announced"] else "silent"
+        counts[f"{presence}/{admission}/{announcement}"] += 1
+    return {
+        "phase": "bootstrap" if store.is_empty() else "steady",
+        "fetch_gate": {"state": gate.state.value, "allows_fetch": gate.allows_fetch, "reason": gate.reason},
+        "last_run": store.last_run(),
+        "products": dict(sorted(counts.items())),
+    }
 
 
 def render_offline(context: JobContext) -> tuple[FeedItem, ...]:

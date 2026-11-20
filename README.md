@@ -28,11 +28,14 @@ uv run --frozen custom-rss run gamepass [--force]
 uv run --frozen custom-rss render gamepass
 uv run --frozen custom-rss backfill gamepass [N]
 uv run --frozen custom-rss dump gamepass PRODUCT_ID
+uv run --frozen custom-rss status gamepass
 ```
 
 `--root` defaults to the current directory and must contain `feeds/<slug>/feed.toml`.
-`run` writes only the selected feed. `render`, `backfill`, and `dump` are Game Pass
-offline operations; they never touch the network.
+`run` writes only the selected feed. `render`, `backfill`, `dump`, and `status` are
+Game Pass offline operations; they never touch the network. `status` writes nothing
+and prints the fetch gate, last run, and product state counts as JSON. Use it to
+answer "will the next run fetch, and why?" without reading the state files.
 
 Exit codes: `0` success, `1` fetch/runtime failure or missing dump ID, `2`
 configuration or argument error.
@@ -61,6 +64,46 @@ configuration or argument error.
 4. Add a thin caller workflow with its cron schedule and `force` dispatch input.
 5. Add focused job tests; no shared runner or renderer edit is needed unless the
    feed requires a new RSS field.
+
+## State machines
+
+All Game Pass state is derived from the files in `feeds/gamepass/state/`. Each
+machine has one named type and one place in `jobs/gamepass.py` that moves it.
+
+**Fetch gate** (`Gate`, decided only by `fetch_gate()` from `runs.jsonl`):
+
+| State | When | Fetches |
+| --- | --- | --- |
+| `forced` | `--force` | yes |
+| `daily-limit` | `max_fetches_per_day` `ok` runs already on this UTC day | no |
+| `cooldown` | latest run is `failed` and `failed_retry_cooldown_hours` haven't passed | no |
+| `open` | otherwise | yes |
+
+**Run** (`RunStatus`, one `runs.jsonl` row): `ok` or `failed`. A gated (skipped)
+run records nothing. A failed run appends its row and rewrites no other file.
+
+**Catalog phase**: `bootstrap` while `products.jsonl` is empty (the first fetch
+seeds silently, then backfill announces the newest `bootstrap_announce`), then
+`steady`.
+
+**Product**: two independent axes per `products.jsonl` row.
+
+```text
+presence:   (new) --admit--> listed  --mark_removed-->  delisted
+                               ^-------mark_present-------'   (same ID back; never re-announced)
+
+admission (suppressed_reason, fixed at admit) -> allowed `announced`
+  fresh      null          true
+  relisting  "relisting"   false   (same title family listed within relisting_window_days)
+  bootstrap  "bootstrap"   false, or true once `backfill` picks it
+```
+
+`Store` rejects impossible combinations on load with the file and line number
+(exit code `2`). Only `bootstrap` rows may have `announced` changed after they
+are admitted.
+
+**Store transaction**: loaded → mutated in memory → `commit()` writes only the
+files whose content changed, or `rollback()` reloads from disk.
 
 ## Guarantees
 

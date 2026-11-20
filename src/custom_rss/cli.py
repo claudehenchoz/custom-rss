@@ -97,6 +97,17 @@ def dump_gamepass(
     return 0
 
 
+def status_gamepass(
+    root: Path,
+    *,
+    client: HttpClient | None = None,
+    now: datetime | None = None,
+) -> int:
+    context = _context(root, "gamepass", client=client, now=now)
+    print(json.dumps(gamepass.status(context), indent=2, ensure_ascii=False))
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="custom-rss", description=__doc__)
     parser.add_argument("--root", type=Path, default=Path("."), help="repository root (default: .)")
@@ -119,6 +130,11 @@ def _build_parser() -> argparse.ArgumentParser:
     dump = subparsers.add_parser("dump", help="print stored raw store JSON for one product")
     dump.add_argument("feed", choices=["gamepass"])
     dump.add_argument("product_id", metavar="PRODUCT_ID")
+
+    status = subparsers.add_parser(
+        "status", help="print the fetch gate and product state counts as JSON; no network"
+    )
+    status.add_argument("feed", choices=["gamepass"])
 
     return parser
 
@@ -146,6 +162,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return backfill_gamepass(root, args.count)
         if args.command == "dump":
             return dump_gamepass(root, args.product_id)
+        if args.command == "status":
+            return status_gamepass(root)
     except (ValueError, FileNotFoundError) as error:
         log.error("%s", error)
         return 2

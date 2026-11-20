@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import xml.etree.ElementTree as ET
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -551,3 +552,121 @@ def test_settings_use_common_language(tmp_path: Path) -> None:
     assert settings.language == "en-us"
     assert settings.tier == "ultimate"
     assert settings.bootstrap_announce == 100
+
+
+# ─── Explicit state machines ─────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("announced", "reason", "message"),
+    [
+        (False, None, "announced must be true"),
+        (True, "relisting", "announced must be false"),
+        (True, "seeded", "suppressed_reason 'seeded'"),
+        ("yes", "bootstrap", "announced must be false or true"),
+    ],
+)
+def test_impossible_product_states_fail_on_load(
+    tmp_path: Path, announced: object, reason: str | None, message: str
+) -> None:
+    row = record(make_info("AAAA1", "Known Game"))
+    row.update(announced=announced, suppressed_reason=reason)
+    state = write_state(tmp_path, [row])
+
+    with pytest.raises(ValueError, match=message) as error:
+        gamepass.Store(state)
+    assert "products.jsonl:1" in str(error.value)
+
+
+def test_unknown_run_status_fails_on_load(tmp_path: Path) -> None:
+    state = write_state(tmp_path, [], runs=[run_row(NOW, "skipped")])
+    with pytest.raises(ValueError, match="runs.jsonl:1: run status 'skipped'"):
+        gamepass.Store(state)
+
+
+def test_fetch_gate_states(tmp_path: Path) -> None:
+    state = write_state(tmp_path, [])
+    gate = lambda store, now=NOW, force=False: gamepass.fetch_gate(store, now, force, SETTINGS)  # noqa: E731
+
+    store = gamepass.Store(state)
+    assert gate(store).state is gamepass.Gate.OPEN
+    assert gate(store, force=True).state is gamepass.Gate.FORCED
+
+    store.runs = [run_row(NOW - timedelta(hours=1))]
+    assert gate(store).state is gamepass.Gate.DAILY_LIMIT
+    assert not gate(store).allows_fetch
+    assert gate(store, force=True).allows_fetch
+    # The day boundary is UTC, independent of the machine's local timezone.
+    assert gate(store, now=NOW.replace(hour=23, minute=59) + timedelta(minutes=1)).state is gamepass.Gate.OPEN
+
+    store.runs = [run_row(NOW - timedelta(days=1)), run_row(NOW - timedelta(hours=2), "failed")]
+    cooling = gate(store)
+    assert cooling.state is gamepass.Gate.COOLDOWN
+    assert "next attempt after 2026-11-21 07:00 UTC" in cooling.reason
+    assert gate(store, now=NOW + timedelta(hours=4)).state is gamepass.Gate.OPEN
+
+    # An ok run after the failure ends the cooldown.
+    store.runs = [run_row(NOW - timedelta(hours=3), "failed"), run_row(NOW - timedelta(hours=2))]
+    two_per_day = replace(SETTINGS, max_fetches_per_day=2)
+    assert gamepass.fetch_gate(store, NOW, False, two_per_day).state is gamepass.Gate.OPEN
+
+
+def test_backfill_cannot_touch_non_bootstrap_rows(tmp_path: Path) -> None:
+    state = write_state(tmp_path, [record(make_info("AAAA1", "Known Game"))])
+    store = gamepass.Store(state)
+    with pytest.raises(ValueError, match="not seeded at bootstrap"):
+        store.set_bootstrap_announced(["AAAA1"], False)
+
+
+def test_returning_product_is_listed_again_but_not_reannounced(tmp_path: Path) -> None:
+    write_config(tmp_path)
+    old = make_info("AAAA1", "Old Game")
+    state = write_state(
+        tmp_path,
+        [record(old, first_seen=NOW - timedelta(days=200), removed_at=NOW - timedelta(days=100))],
+    )
+    context = make_context(tmp_path, FakeJsonHttp([HEADER, {"id": "AAAA1"}]))
+
+    items = gamepass.build(context)
+
+    row = json.loads((state / "products.jsonl").read_text().splitlines()[0])
+    assert row["removed_at"] is None
+    assert [item.published for item in items] == [NOW - timedelta(days=200)]
+
+
+def test_status_reports_every_state_without_http(tmp_path: Path) -> None:
+    write_config(tmp_path)
+    write_state(
+        tmp_path,
+        [
+            record(make_info("AAAA1", "Fresh")),
+            record(make_info("BBBB1", "Seeded"), announced=False, suppressed_reason="bootstrap",
+                   removed_at=NOW - timedelta(days=1)),
+        ],
+        runs=[run_row(NOW - timedelta(hours=1), "failed")],
+    )
+    context = make_context(tmp_path, object(), force=False)
+
+    snapshot = gamepass.status(context)
+
+    assert snapshot["phase"] == "steady"
+    assert snapshot["fetch_gate"]["state"] == "cooldown"
+    assert snapshot["fetch_gate"]["allows_fetch"] is False
+    assert snapshot["last_run"]["status"] == "failed"
+    assert snapshot["products"] == {"delisted/bootstrap/silent": 1, "listed/fresh/announced": 1}
+
+
+def test_status_cli_prints_json_and_writes_nothing(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from custom_rss import cli
+
+    write_config(tmp_path)
+    state = write_state(tmp_path, [record(make_info("AAAA1", "Fresh"))])
+    before = {path: path.read_bytes() for path in state.rglob("*") if path.is_file()}
+
+    assert cli.main(["--root", str(tmp_path), "status", "gamepass"]) == 0
+
+    snapshot = json.loads(capsys.readouterr().out)
+    assert snapshot["fetch_gate"]["state"] == "open"
+    assert snapshot["products"] == {"listed/fresh/announced": 1}
+    assert {path: path.read_bytes() for path in state.rglob("*") if path.is_file()} == before
+    assert not (tmp_path / "feeds" / "gamepass" / "feed.xml").exists()
