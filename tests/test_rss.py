@@ -9,6 +9,7 @@ import pytest
 
 from custom_rss.models import FeedConfig, FeedItem, Media, Source
 from custom_rss.rss import ATOM_NS, MEDIA_NS, render_feed
+from custom_rss.schedule import Cadence, Schedule
 
 
 def make_config(**overrides: object) -> FeedConfig:
@@ -23,6 +24,7 @@ def make_config(**overrides: object) -> FeedConfig:
         "max_items": 100,
         "directory": Path("/nonexistent"),
         "settings": {},
+        "schedule": Schedule(Cadence.HOUR),
     }
     values.update(overrides)
     return FeedConfig(**values)  # type: ignore[arg-type]

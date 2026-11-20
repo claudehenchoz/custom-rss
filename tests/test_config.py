@@ -15,6 +15,9 @@ language = "en-us"
 ttl = 60
 max_items = 100
 
+[schedule]
+every = "hour"
+
 [job]
 tier = "ultimate"
 """
@@ -85,3 +88,17 @@ def test_requires_job_table(tmp_path: Path) -> None:
 def test_missing_file_names_the_path(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         load_config("absent", tmp_path)
+
+
+
+def test_requires_schedule_table(tmp_path: Path) -> None:
+    write_config(tmp_path, BASE.replace('[schedule]\nevery = "hour"\n\n', ""))
+
+    with pytest.raises(ValueError, match=r"\[schedule\] table is required"):
+        load_config("demo", tmp_path)
+
+
+def test_parses_schedule(tmp_path: Path) -> None:
+    write_config(tmp_path, BASE.replace('every = "hour"', 'every = "day"\nat = "05:00"'))
+
+    assert load_config("demo", tmp_path).schedule.describe() == "every day at 05:00 UTC"

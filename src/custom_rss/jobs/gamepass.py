@@ -32,7 +32,7 @@ from urllib.parse import urlencode
 
 from ..files import write_text_atomic
 from ..http import FetchError, HttpClient
-from ..models import FeedConfig, FeedItem, JobContext, Media
+from ..models import Deferred, FeedConfig, FeedItem, JobContext, Media
 
 log = logging.getLogger("custom_rss.jobs.gamepass")
 
@@ -988,6 +988,8 @@ def build(context: JobContext) -> tuple[FeedItem, ...]:
     settings = load_settings(context.config)
     store = Store(context.config.state_dir)
     gate = fetch_gate(store, context.now, context.force, settings)
+    if gate.state is Gate.COOLDOWN:
+        raise Deferred(gate.reason)     # Not done today yet: the next hourly tick asks again.
     if not gate.allows_fetch:
         log.info("Not fetching (%s): %s", gate.state, gate.reason)
         return announced_items(store)

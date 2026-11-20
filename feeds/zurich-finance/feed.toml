@@ -6,6 +6,9 @@ language = "de-ch"
 ttl = 60
 max_items = 100
 
+[schedule]
+every = "hour"
+
 [job]
 max_workers = 5
 patterns = [

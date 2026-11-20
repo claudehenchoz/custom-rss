@@ -1,0 +1,81 @@
+name: Feeds
+
+# One hourly tick. Each feed decides from its own [schedule] in feed.toml
+# whether it is due (see `custom-rss schedule`); this file never changes
+# when a feed is added or rescheduled.
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      feed:
+        description: "Run only this feed slug now, ignoring its schedule (empty = every due feed)"
+        type: string
+        default: ""
+      force:
+        description: "Run every selected feed and bypass their own rate limits"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  TZ: UTC
+
+concurrency:
+  group: custom-rss-feeds-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.9"
+          enable-cache: true
+
+      - run: uv sync --frozen
+
+      - name: Run due feeds
+        id: run
+        shell: bash
+        env:
+          FEED: ${{ inputs.feed }}
+          FORCE: ${{ inputs.force && '--force' || '' }}
+        run: |
+          if [ -n "$FEED" ]; then
+            uv run --frozen custom-rss run "$FEED" $FORCE
+          else
+            uv run --frozen custom-rss tick $FORCE
+          fi
+
+      # Runs even if a feed failed, so other feeds' updates and Game Pass
+      # failure audit rows are kept. The job still ends red because steps.run failed.
+      - name: Commit feed changes
+        if: always() && steps.run.outcome != 'skipped'
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- feeds
+          if git diff --cached --quiet; then
+            echo "No feed changes"
+            exit 0
+          fi
+          changed=$(git diff --cached --name-only -- feeds | cut -d/ -f2 | sort -u | paste -sd, - | sed 's/,/, /g')
+          git commit -m "Update feeds: $changed"
+          for attempt in 1 2 3; do
+            git pull --rebase origin "${{ github.ref_name }}"
+            if git push origin "HEAD:${{ github.ref_name }}"; then
+              exit 0
+            fi
+            echo "Push attempt $attempt failed; retrying" >&2
+          done
+          echo "Failed to push after 3 attempts" >&2
+          exit 1

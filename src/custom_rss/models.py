@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Mapping
 
 if TYPE_CHECKING:
     from .http import HttpClient
+    from .schedule import Schedule
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,7 @@ class FeedConfig:
     max_items: int
     directory: Path
     settings: Mapping[str, Any]
+    schedule: Schedule
 
     @property
     def output_path(self) -> Path:
@@ -59,6 +61,10 @@ class FeedConfig:
     @property
     def state_dir(self) -> Path:
         return self.directory / "state"
+
+
+class Deferred(Exception):
+    """Raised by a job that is not done yet: nothing is written and the next tick retries."""
 
 
 @dataclass(frozen=True)

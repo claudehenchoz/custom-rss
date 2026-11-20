@@ -13,8 +13,9 @@ from .config import load_config
 from .files import write_bytes_atomic
 from .http import USER_AGENT, HttpClient
 from .jobs import JOBS, gamepass
-from .models import FeedItem, JobContext
+from .models import Deferred, FeedItem, JobContext
 from .rss import render_feed
+from .schedule import is_due, next_slot, read_last_success, record_success
 
 log = logging.getLogger("custom_rss")
 
@@ -51,9 +52,62 @@ def run_feed(
     client: HttpClient | None = None,
     now: datetime | None = None,
 ) -> int:
+    """Run one feed now, ignoring its schedule, and record the success."""
     context = _context(root, slug, force=force, client=client, now=now)
-    items = JOBS[slug](context)
+    try:
+        items = JOBS[slug](context)
+    except Deferred as why:
+        log.info("%s deferred: %s", slug, why)
+        return 0
     _write_feed(context, items)
+    record_success(context.config.directory, context.config.schedule, context.now)
+    return 0
+
+
+def _schedule_entry(root: Path, slug: str, now: datetime) -> dict:
+    config = load_config(slug, root)
+    last = read_last_success(config.directory)
+    due = is_due(config.schedule, last, now)
+    return {
+        "feed": slug,
+        "schedule": config.schedule.describe(),
+        "last_success": last.isoformat() if last else None,
+        "due": due,
+        "next_run": "next tick" if due else next_slot(config.schedule, now).isoformat(),
+    }
+
+
+def tick(
+    root: Path,
+    *,
+    force: bool = False,
+    client: HttpClient | None = None,
+    now: datetime | None = None,
+) -> int:
+    """Run every due feed (every feed with ``force``); one failure never blocks the others."""
+    now = now if now is not None else datetime.now(timezone.utc)
+    failed: list[str] = []
+    for slug in JOBS:
+        try:
+            entry = _schedule_entry(root, slug, now)
+            if not force and not entry["due"]:
+                log.info("%s: not due (%s); next run after %s", slug, entry["schedule"], entry["next_run"])
+                continue
+            log.info("%s: %s (%s, last success %s)", slug, "forced" if force else "due",
+                     entry["schedule"], entry["last_success"] or "never recorded")
+            run_feed(root, slug, force=force, client=client, now=now)
+        except Exception as error:  # noqa: BLE001 - isolate feeds from each other
+            log.error("%s failed: %s", slug, error)
+            failed.append(slug)
+    if failed:
+        log.error("Failed feed(s): %s", ", ".join(failed))
+        return 1
+    return 0
+
+
+def schedule_report(root: Path, *, now: datetime | None = None) -> int:
+    now = now if now is not None else datetime.now(timezone.utc)
+    print(json.dumps([_schedule_entry(root, slug, now) for slug in JOBS], indent=2))
     return 0
 
 
@@ -120,6 +174,17 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("feed", choices=sorted(JOBS))
     run.add_argument("--force", action="store_true", help="bypass the feed's own rate limit")
 
+    tick_parser = subparsers.add_parser(
+        "tick", help="run every feed whose [schedule] says it is due (the hourly workflow)"
+    )
+    tick_parser.add_argument(
+        "--force", action="store_true", help="run every feed and bypass their own rate limits"
+    )
+
+    subparsers.add_parser(
+        "schedule", help="print each feed's schedule, last success and next run as JSON; no network"
+    )
+
     render = subparsers.add_parser("render", help="rewrite a feed from stored state; no network")
     render.add_argument("feed", choices=["gamepass"])
 
@@ -156,6 +221,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.command == "run":
             return run_feed(root, args.feed, force=args.force)
+        if args.command == "tick":
+            return tick(root, force=args.force)
+        if args.command == "schedule":
+            return schedule_report(root)
         if args.command == "render":
             return render_gamepass(root)
         if args.command == "backfill":

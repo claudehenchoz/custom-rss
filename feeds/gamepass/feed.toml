@@ -6,6 +6,10 @@ language = "en-us"
 ttl = 1440
 max_items = 100
 
+[schedule]
+every = "day"
+at = "03:00"
+
 [job]
 tier = "ultimate"
 platform = "pc"

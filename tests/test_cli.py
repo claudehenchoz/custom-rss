@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 import custom_rss.cli as cli
-from custom_rss.models import FeedItem
+from custom_rss.models import Deferred, FeedItem
 
 NOW = datetime(2026, 11, 21, 3, 0, tzinfo=timezone.utc)
 
@@ -20,6 +20,8 @@ def write_config(
     *,
     title: str = "Test Feed",
     link: str = "https://example.test/feed",
+    every: str = "hour",
+    at: str | None = None,
 ) -> Path:
     lines = [
         f"title = {json.dumps(title)}",
@@ -29,6 +31,10 @@ def write_config(
         f"language = {json.dumps('en-us')}",
         "ttl = 60",
         "max_items = 100",
+        "",
+        "[schedule]",
+        f"every = {json.dumps(every)}",
+        *([f"at = {json.dumps(at)}"] if at else []),
         "",
         "[job]",
         'tier = "ultimate"',
@@ -186,3 +192,98 @@ def test_gamepass_render_dump_and_backfill_arguments(
 
     assert cli.main(["--root", str(tmp_path), "backfill", "gamepass"]) == 0
     assert backfills == [0, 7]
+
+
+# ─── Scheduling ──────────────────────────────────────────────────────────────
+
+
+def _at(hour: int, minute: int = 17) -> datetime:
+    return datetime(2026, 11, 21, hour, minute, tzinfo=timezone.utc)
+
+
+def test_tick_runs_only_due_feeds_and_records_daily_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(tmp_path, "hourly")
+    write_config(tmp_path, "daily", every="day", at="03:00")
+    calls: list[str] = []
+
+    def job(slug: str):
+        def run(context: object) -> tuple[FeedItem, ...]:
+            calls.append(slug)
+            return (make_item(),)
+        return run
+
+    monkeypatch.setattr(cli, "JOBS", {"hourly": job("hourly"), "daily": job("daily")})
+
+    assert cli.tick(tmp_path, now=_at(3)) == 0
+    assert calls == ["hourly", "daily"]
+    assert not (tmp_path / "feeds" / "hourly" / "last_run.json").exists()
+    record = json.loads((tmp_path / "feeds" / "daily" / "last_run.json").read_text())
+    assert record == {"last_success": "2026-11-21T03:17:00+00:00"}
+
+    calls.clear()
+    assert cli.tick(tmp_path, now=_at(4)) == 0
+    assert calls == ["hourly"]
+
+    calls.clear()
+    assert cli.tick(tmp_path, now=_at(5), force=True) == 0
+    assert calls == ["hourly", "daily"]
+
+
+def test_tick_isolates_failures_and_exits_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(tmp_path, "broken", every="day", at="03:00")
+    write_config(tmp_path, "healthy")
+
+    def broken(context: object) -> tuple[FeedItem, ...]:
+        raise RuntimeError("upstream down")
+
+    monkeypatch.setattr(cli, "JOBS", {"broken": broken, "healthy": lambda context: (make_item(),)})
+
+    assert cli.tick(tmp_path, now=NOW) == 1
+    assert (tmp_path / "feeds" / "healthy" / "feed.xml").exists()
+    assert not (tmp_path / "feeds" / "broken" / "last_run.json").exists()  # retried next tick
+    assert cli.main(["--root", str(tmp_path), "tick"]) == 1
+
+
+def test_deferred_job_writes_nothing_and_stays_due(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(tmp_path, "daily", every="day", at="03:00")
+
+    def deferred(context: object) -> tuple[FeedItem, ...]:
+        raise Deferred("cooling down")
+
+    monkeypatch.setattr(cli, "JOBS", {"daily": deferred})
+
+    assert cli.main(["--root", str(tmp_path), "run", "daily"]) == 0
+    assert not (tmp_path / "feeds" / "daily" / "feed.xml").exists()
+    assert not (tmp_path / "feeds" / "daily" / "last_run.json").exists()
+
+
+def test_schedule_command_prints_json_and_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_config(tmp_path, "hourly")
+    write_config(tmp_path, "daily", every="day", at="03:00")
+    (tmp_path / "feeds" / "daily" / "last_run.json").write_text(
+        json.dumps({"last_success": "2026-11-21T03:17:00+00:00"})
+    )
+    monkeypatch.setattr(cli, "JOBS", {"hourly": lambda c: (), "daily": lambda c: ()})
+    before = sorted(tmp_path.rglob("*"))
+
+    assert cli.schedule_report(tmp_path, now=_at(9, 0)) == 0
+
+    assert json.loads(capsys.readouterr().out) == [
+        {"feed": "hourly", "schedule": "every hour", "last_success": None, "due": True, "next_run": "next tick"},
+        {
+            "feed": "daily",
+            "schedule": "every day at 03:00 UTC",
+            "last_success": "2026-11-21T03:17:00+00:00",
+            "due": False,
+            "next_run": "2026-11-22T03:00:00+00:00",
+        },
+    ]
+    assert sorted(tmp_path.rglob("*")) == before

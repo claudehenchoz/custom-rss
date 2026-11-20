@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .models import FeedConfig
+from .schedule import parse_schedule
 
 
 def _require_str(raw: dict, key: str, where: Path) -> str:
@@ -55,6 +56,7 @@ def load_config(slug: str, root: Path) -> FeedConfig:
     settings = raw.get("job")
     if not isinstance(settings, dict):
         raise ValueError(f"{path}: a [job] table is required")
+    schedule = parse_schedule(raw.get("schedule"), path)
 
     return FeedConfig(
         slug=slug,
@@ -67,4 +69,5 @@ def load_config(slug: str, root: Path) -> FeedConfig:
         max_items=max_items,
         directory=directory,
         settings=settings,
+        schedule=schedule,
     )

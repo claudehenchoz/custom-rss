@@ -15,7 +15,7 @@ from custom_rss.config import load_config
 from custom_rss.http import FetchError
 from custom_rss.jobs import gamepass
 from custom_rss.jobs.gamepass import GameInfo, GamePassSettings
-from custom_rss.models import JobContext
+from custom_rss.models import Deferred, JobContext
 from custom_rss.rss import MEDIA_NS, render_feed
 
 NOW = datetime(2026, 11, 21, 3, 0, tzinfo=timezone.utc)
@@ -53,6 +53,10 @@ def write_config(tmp_path: Path, **overrides: object) -> Path:
         f"language = {json.dumps('en-us')}",
         "ttl = 1440",
         "max_items = 100",
+        "",
+        "[schedule]",
+        'every = "day"',
+        'at = "03:00"',
         "",
         "[job]",
     ]
@@ -670,3 +674,20 @@ def test_status_cli_prints_json_and_writes_nothing(tmp_path: Path, capsys: pytes
     assert snapshot["products"] == {"listed/fresh/announced": 1}
     assert {path: path.read_bytes() for path in state.rglob("*") if path.is_file()} == before
     assert not (tmp_path / "feeds" / "gamepass" / "feed.xml").exists()
+
+
+
+def test_cooldown_defers_without_http(tmp_path: Path) -> None:
+    write_config(tmp_path)
+    write_state(
+        tmp_path,
+        [record(make_info("AAAA1", "Known Game"))],
+        runs=[run_row(NOW - timedelta(hours=1), "failed")],
+    )
+
+    class ForbiddenHttp:
+        def get_json(self, url: str):
+            raise AssertionError(f"unexpected HTTP request: {url}")
+
+    with pytest.raises(Deferred, match="next attempt after"):
+        gamepass.build(make_context(tmp_path, ForbiddenHttp(), force=False))
