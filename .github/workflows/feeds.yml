@@ -6,7 +6,7 @@ name: Feeds
 
 on:
   schedule:
-    - cron: "17 * * * *"
+    - cron: "41 * * * *"
   workflow_dispatch:
     inputs:
       feed:
