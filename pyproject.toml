@@ -3,7 +3,10 @@ name = "custom-rss"
 version = "0.1.0"
 description = "Deterministic RSS 2.0 feeds generated from publisher feeds and store catalogs."
 requires-python = ">=3.13"
-dependencies = ["feedparser>=6.0,<7"]
+dependencies = [
+    "feedparser>=6.0,<7",
+    "pillow>=11,<13",
+]
 
 [project.scripts]
 custom-rss = "custom_rss.cli:main"

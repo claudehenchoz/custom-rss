@@ -11,6 +11,7 @@ writes, and the CLI.
 | --- | --- | --- |
 | Zurich financial services news | <https://claudehenchoz.github.io/custom-rss/feeds/zurich-finance/feed.xml> | Every hour |
 | New on Game Pass Ultimate (PC, CH) | <https://claudehenchoz.github.io/custom-rss/feeds/gamepass/feed.xml> | Every day from `03:00` UTC |
+| SBB Resale: new items for sale | <https://claudehenchoz.github.io/custom-rss/feeds/sbb-resale/feed.xml> | Every hour |
 
 GitHub Pages serves the committed `feeds/<slug>/feed.xml` files. Raw
 `raw.githubusercontent.com` URLs return `text/plain` and are only fallback
@@ -63,6 +64,7 @@ configuration or argument error.
 | `feeds/<slug>/last_run.json` | Start time of the last successful run (daily and weekly feeds only). |
 | `feeds/<slug>/feed.xml` | Generated output, committed by the scheduled workflow. |
 | `feeds/gamepass/state/` | Game Pass catalog diff state, run audit log, raw products. |
+| `feeds/sbb-resale/images/` | Copies of SBB Resale offer photos, served next to the feed. |
 | `.github/workflows/feeds.yml` | The single hourly tick plus commit/push protocol. |
 
 ## Adding a feed

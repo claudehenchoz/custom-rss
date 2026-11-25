@@ -60,7 +60,7 @@ def make_item(title: str = "CLI Story", guid: str = "cli-story") -> FeedItem:
 
 def test_list_prints_registered_slugs(capsys: pytest.CaptureFixture[str]) -> None:
     assert cli.main(["list"]) == 0
-    assert capsys.readouterr().out.split() == ["zurich-finance", "gamepass"]
+    assert capsys.readouterr().out.split() == ["zurich-finance", "gamepass", "sbb-resale"]
 
 
 def test_run_executes_only_the_selected_job(

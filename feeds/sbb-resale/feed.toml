@@ -1,0 +1,18 @@
+title = "SBB Resale"
+description = "New items for sale on SBB Resale, with photo, price and key facts."
+link = "https://sbbresale.ch/offers?language=en&page=1&sortField=updatedAt"
+self_url = "https://claudehenchoz.github.io/custom-rss/feeds/sbb-resale/feed.xml"
+language = "en"
+ttl = 60
+max_items = 100
+
+[schedule]
+every = "hour"
+
+[cache]
+max_items = 100
+
+[job]
+api_url = "https://sbb-resale-webapi.azurewebsites.net/offers"
+limit = 50
+languages = ["en", "de", "fr", "it"]
